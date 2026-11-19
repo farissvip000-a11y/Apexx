@@ -160,6 +160,8 @@ table.t{width:100%;border-collapse:collapse} table.t th,table.t td{padding:10px 
 .tile .body{padding:12px 14px}
 .tile .fav{position:absolute;top:8px;inset-inline-end:8px;background:rgba(0,0,0,.35);color:#fff;border-radius:99px;width:32px;height:32px;display:grid;place-items:center}
 .tile .fav.on{background:var(--warn)}
+.tile .aibtn{position:absolute;top:8px;inset-inline-start:8px;background:rgba(79,70,229,.92);color:#fff;border:0;border-radius:99px;width:32px;height:32px;display:grid;place-items:center;cursor:pointer;z-index:2}
+.is-offline .ai-btn{opacity:.5}
 .listview .tile{display:flex;align-items:center}.listview .cover{width:90px;height:72px;border-radius:14px 0 0 14px}
 .doc-body{white-space:pre-wrap;line-height:1.8;font-size:1.05rem}
 .doc-body img{max-width:100%;border-radius:12px}
@@ -1141,7 +1143,7 @@ const { emptyState, pageHead, toast } = __r('js/components/ui.js');
 const { newSchedule } = __r('js/services/srs.js');
 const { go } = __r('js/router.js');
 const repo = __r('js/services/repo.js');
-const { PROVIDERS, getProvider, setProvider, getKey, setKey, getModel, setModel, buildQuestionsPrompt, buildCardsPrompt, callModel, parseQuestions, parseCards, extractPdfText, AiError } = __r('js/services/ai-generate.js');
+const { PROVIDERS, getProvider, setProvider, getKey, setKey, getModel, setModel, buildQuestionsPrompt, buildCardsPrompt, callModel, parseQuestions, parseCards, extractPdfText, AiError, listPuterModels, CHAT_SYSTEM, buildChatPrompt } = __r('js/services/ai-generate.js');
 
 // Local model registry: nothing is bundled. A future build can register an adapter with this shape.
 const modelRegistry = { adapters: [], active: null };
@@ -1166,6 +1168,7 @@ async function render(root) {
   const decks = await db.getAll('decks');
   const body = h('div', { class: 'grid' });
   root.append(pageHead(t('ai_title'), t('ai_sub')), h('div', { class: 'banner mb' }, t('ai_no_model')), body);
+  body.append(askCard(allDocs));
   body.append(generatorCard(allDocs));
   body.append(h('div', { class: 'card' }, h('div', { class: 'card-title', html: icon('ai') + `<h3>${t('ai_offline_tools')}</h3>` }), h('h3', { class: 'small' }, t('ai_keywords')), h('p', { class: 'muted small mb' }, t('ai_keywords_desc')),
     docs.length === 0 ? emptyState(t('ai_no_text'), 'empty-library') : (() => {
@@ -1194,6 +1197,53 @@ async function render(root) {
 }
 
 
+// ---------- Ask the sheet: chat about a document, with explanations ----------
+function askCard(allDocs) {
+  const docSel = h('select', null, h('option', { value: '' }, t('ai_paste_instead')), allDocs.map((d) => h('option', { value: d.id }, `${d.name} (${d.kind.toUpperCase()})`)));
+  const paste = h('textarea', { rows: 3, placeholder: t('ai_paste_ph') });
+  const log = h('div', { class: 'mt', style: { display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '55vh', overflowY: 'auto' } });
+  const q = h('textarea', { rows: 2, placeholder: t('ai_ask_ph'), style: { direction: 'auto' } });
+  const status = h('div', { class: 'small muted mt-s' });
+  const history = []; let cache = { id: null, text: '' }; let busy = false;
+  const fmt = (x) => esc(x).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+  const bubble = (role, text) => { const el = h('div', { style: { direction: 'auto', padding: '10px 12px', borderRadius: '12px', background: role === 'user' ? 'rgba(37,99,235,.12)' : 'rgba(127,127,127,.12)', alignSelf: role === 'user' ? 'flex-start' : 'stretch', lineHeight: 1.8 }, html: fmt(text) }); log.append(el); log.scrollTop = log.scrollHeight; return el; };
+  async function getText() {
+    if (paste.value.trim().length > 50) return paste.value;
+    const d = allDocs.find((x) => x.id === docSel.value); if (!d) throw new AiError('nosrc', 'no source');
+    if (cache.id === d.id && cache.text) return cache.text;
+    let text = d.textCache || '';
+    if (!text.trim() && d.kind === 'pdf') {
+      status.textContent = t('ai_reading_pdf'); const blob = await repo.getBlob(d.blobId); if (!blob) throw new AiError('nosrc', 'file missing');
+      text = await extractPdfText(blob); if (text.trim()) await db.update('documents', d.id, { textCache: text }).catch(() => {});
+    }
+    if (!text.trim()) throw new AiError('notext', 'no text');
+    cache = { id: d.id, text }; return text;
+  }
+  async function send() {
+    const question = q.value.trim(); if (!question || busy) return;
+    const provider = getProvider(); const key = getKey(provider);
+    if (!PROVIDERS[provider].noKey && !key) { status.textContent = t('ai_need_key'); return; }
+    busy = true; sendBtn.disabled = true; status.textContent = t('ai_working');
+    let wait;
+    try {
+      const text = await getText();
+      bubble('user', question); q.value = ''; wait = bubble('ai', '…');
+      const raw = await callModel({ provider, apiKey: key, model: getModel(provider), system: CHAT_SYSTEM, maxTokens: 3000, prompt: buildChatPrompt(text, question, history) });
+      const ans = String(raw).trim(); wait.innerHTML = fmt(ans); history.push({ role: 'user', text: question }, { role: 'ai', text: ans }); status.textContent = '';
+    } catch (e) {
+      if (wait) wait.remove(); console.error(e);
+      status.textContent = t({ network: 'ai_err_network', auth: 'ai_err_auth', rate: 'ai_err_rate', nosrc: 'ai_err_nosrc', model: 'ai_err_model', notext: 'ai_err_notext', parse: 'ai_err_parse' }[e.code] || 'ai_err_generic', { msg: e.message });
+    } finally { busy = false; sendBtn.disabled = false; }
+  }
+  const sendBtn = h('button', { class: 'btn', onclick: send, html: icon('ai') + `<span>${t('ai_ask_send')}</span>` });
+  q.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
+  docSel.addEventListener('change', () => { history.length = 0; log.textContent = ''; });
+  return h('div', { class: 'card' }, h('div', { class: 'card-title', html: icon('ai') + `<h3>${t('ai_ask_title')}</h3>` }),
+    h('p', { class: 'muted small mb' }, t('ai_ask_desc')),
+    h('div', { class: 'field' }, h('label', null, t('ai_source')), docSel), h('div', { class: 'field' }, paste),
+    log, h('div', { class: 'field mt' }, q), h('div', { class: 'row gap-s' }, sendBtn, h('button', { class: 'btn secondary', onclick: () => { history.length = 0; log.textContent = ''; status.textContent = ''; } }, t('ai_ask_clear'))), status);
+}
+
 // ---------- AI generation (online, needs the user's own Anthropic API key) ----------
 function generatorCard(allDocs) {
   let provider = getProvider();
@@ -1204,7 +1254,9 @@ function generatorCard(allDocs) {
   const custom = h('input', { type: 'text', dir: 'ltr', placeholder: t('ai_custom_model'), value: '' });
   const provSel = h('select', { onchange: () => { setKey(keyIn.value); provider = provSel.value; setProvider(provider); syncProvider(); } }, Object.entries(PROVIDERS).map(([k, p]) => h('option', { value: k, selected: k === provider }, p.label)));
   function syncProvider() {
-    const p = PROVIDERS[provider]; keyIn.value = getKey(provider); keyIn.placeholder = p.keyHint; keyHelp.textContent = t('ai_get_key', { url: p.keyUrl });
+    const p = PROVIDERS[provider]; keyIn.value = getKey(provider); keyIn.placeholder = p.keyHint; keyHelp.textContent = p.noKey ? t('ai_no_key_needed') : t('ai_get_key', { url: p.keyUrl });
+    keyIn.hidden = keyLbl.hidden = !!p.noKey;
+    if (provider === 'puter' && !p.live) { p.live = true; listPuterModels().then((ids) => { if (!ids.length) return; const have = new Set(p.models.map((m) => m.id)); ids.forEach((id) => { if (!have.has(id)) p.models.push({ id, label: id }); }); if (provider === 'puter') syncProvider(); }); }
     modelSel.textContent = ''; const cur = getModel(provider);
     p.models.forEach((m) => modelSel.append(h('option', { value: m.id, selected: m.id === cur }, m.label)));
     custom.value = p.models.some((m) => m.id === cur) ? '' : cur;
@@ -1233,7 +1285,7 @@ function generatorCard(allDocs) {
     return { text, doc: d };
   }
   async function generate() {
-    out.textContent = ''; const key = keyIn.value.trim(); if (!key) { status.textContent = t('ai_need_key'); return; } setKey(key, provider); setModel(chosenModel(), provider);
+    out.textContent = ''; const key = keyIn.value.trim(); if (!key && !PROVIDERS[provider].noKey) { status.textContent = t('ai_need_key'); return; } setKey(key, provider); setModel(chosenModel(), provider);
     genBtn.disabled = true; status.textContent = t('ai_working');
     try {
       const { text, doc } = await sourceText(); const n = Math.max(3, Math.min(30, Number(count.value) || 10)); status.textContent = t('ai_working');
@@ -1247,6 +1299,7 @@ function generatorCard(allDocs) {
       }
       status.textContent = '';
     } catch (e) {
+      console.error(e);
       status.textContent = e.name === 'AbortError' ? '' : t({ network: 'ai_err_network', auth: 'ai_err_auth', rate: 'ai_err_rate', nosrc: 'ai_err_nosrc', model: 'ai_err_model', notext: 'ai_err_notext', parse: 'ai_err_parse' }[e.code] || 'ai_err_generic', { msg: e.message });
     } finally { genBtn.disabled = false; }
   }
@@ -1281,6 +1334,153 @@ function generatorCard(allDocs) {
     h('div', { class: 'field' }, h('label', null, t('ai_source')), docSel), h('div', { class: 'field' }, paste),
     h('div', { class: 'grid cols-3' }, h('div', { class: 'field' }, h('label', null, t('ai_what')), kindSel), h('div', { class: 'field' }, h('label', null, t('ai_count')), count), h('div', { class: 'field' }, h('label', null, t('difficulty')), diff)),
     typesRow, h('div', { class: 'row mt' }, genBtn), status, out);
+}
+
+};
+__d['js/features/ai/ai-actions.js'] = function(exports){'use strict';
+Object.defineProperty(exports,'aiAvailable',{enumerable:true,get:()=>aiAvailable});
+Object.defineProperty(exports,'aiMenu',{enumerable:true,get:()=>aiMenu});
+Object.defineProperty(exports,'aiAsk',{enumerable:true,get:()=>aiAsk});
+Object.defineProperty(exports,'aiGenerate',{enumerable:true,get:()=>aiGenerate});
+Object.defineProperty(exports,'aiTileBtn',{enumerable:true,get:()=>aiTileBtn});
+Object.defineProperty(exports,'aiPageBtn',{enumerable:true,get:()=>aiPageBtn});
+Object.defineProperty(exports,'aiGenBtn',{enumerable:true,get:()=>aiGenBtn});
+// AI entry points used across the app (library, flashcards, exams). Nothing here touches the network until the user clicks;
+// offline, the buttons just explain that AI needs internet and everything else keeps working.
+const db = __r('js/database/db.js');
+const { h, esc } = __r('js/services/utils.js');
+const { t } = __r('js/services/i18n.js');
+const { icon } = __r('js/services/icons.js');
+const { toast, modal } = __r('js/components/ui.js');
+const { newSchedule } = __r('js/services/srs.js');
+const { go } = __r('js/router.js');
+const repo = __r('js/services/repo.js');
+const ai = __r('js/services/ai-generate.js');
+
+const KINDS = ['txt', 'docx', 'pptx', 'pdf'];
+const aiAvailable = (d) => !!d && KINDS.includes(d.kind);
+const online = () => navigator.onLine !== false;
+(function watchNet() { if (globalThis.__aiNet) return; globalThis.__aiNet = 1; const f = () => document.documentElement.classList.toggle('is-offline', !online()); window.addEventListener('online', f); window.addEventListener('offline', f); f(); })();
+const guard = () => { if (online()) return true; toast(t('ai_offline'), 'err'); return false; };
+const errMsg = (e) => t({ network: 'ai_err_network', auth: 'ai_err_auth', rate: 'ai_err_rate', nosrc: 'ai_err_nosrc', model: 'ai_err_model', notext: 'ai_err_notext', parse: 'ai_err_parse' }[e.code] || 'ai_err_generic', { msg: e.message });
+const creds = () => { const provider = ai.getProvider(); return { provider, apiKey: ai.getKey(provider), model: ai.getModel(provider) }; };
+const needKey = (c) => !ai.PROVIDERS[c.provider].noKey && !c.apiKey;
+const fmt = (x) => esc(x).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
+
+async function docText(d, status) {
+  let text = d.textCache || '';
+  if (!text.trim() && d.kind === 'pdf') {
+    if (status) status.textContent = t('ai_reading_pdf');
+    const blob = await repo.getBlob(d.blobId); if (!blob) throw new ai.AiError('nosrc', 'file missing');
+    text = await ai.extractPdfText(blob); if (text.trim()) await db.update('documents', d.id, { textCache: text }).catch(() => {});
+  }
+  if (!text.trim()) throw new ai.AiError('notext', 'no text');
+  return text;
+}
+
+// ---------- buttons ----------
+const mkBtn = (cls, label, onClick, withIcon = true) => h('button', { class: 'btn ai-btn ' + cls, type: 'button', title: label, onclick: (e) => { e.stopPropagation(); onClick(e); }, html: (withIcon ? icon('ai') : '') + `<span>${label}</span>` });
+const aiPageBtn = (d) => (aiAvailable(d) ? mkBtn('ghost', t('ai_btn'), () => aiMenu(d)) : h('span', { hidden: true }));
+const aiGenBtn = (kind, opts = {}) => mkBtn('secondary', t(kind === 'cards' ? 'ai_gen_cards_btn' : 'ai_gen_q_btn'), () => aiGenerate({ kind, ...opts }));
+const aiTileBtn = (d) => (aiAvailable(d) ? h('button', { class: 'aibtn ai-btn', type: 'button', 'aria-label': t('ai_btn'), title: t('ai_btn'), onclick: (e) => { e.stopPropagation(); aiMenu(d); }, html: icon('ai') }) : null);
+
+function aiMenu(d) {
+  if (!guard()) return;
+  const item = (ic, label, fn) => h('button', { class: 'btn secondary', type: 'button', style: { width: '100%', justifyContent: 'flex-start', marginBottom: '8px' }, onclick: () => { m.close(); fn(); }, html: icon(ic) + `<span>${label}</span>` });
+  const m = modal({ title: `${t('ai_btn')} — ${d.name}`, body: h('div', null,
+    item('ai', t('ai_menu_ask'), () => aiAsk(d)), item('cards', t('ai_menu_cards'), () => aiGenerate({ kind: 'cards', doc: d })), item('check', t('ai_menu_questions'), () => aiGenerate({ kind: 'questions', doc: d }))),
+    actions: [{ label: t('close'), kind: 'ghost' }] });
+}
+
+// ---------- ask / explain ----------
+function aiAsk(d) {
+  if (!guard()) return;
+  const log = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '48vh', overflowY: 'auto', minHeight: '90px' } });
+  const q = h('textarea', { rows: 2, placeholder: t('ai_ask_ph'), style: { direction: 'auto' } });
+  const status = h('div', { class: 'small muted mt-s' }); const history = []; let text = null; let busy = false;
+  const bubble = (role, msg) => { const el = h('div', { style: { direction: 'auto', padding: '10px 12px', borderRadius: '12px', background: role === 'user' ? 'rgba(37,99,235,.12)' : 'rgba(127,127,127,.12)', alignSelf: role === 'user' ? 'flex-start' : 'stretch', lineHeight: 1.8 }, html: fmt(msg) }); log.append(el); log.scrollTop = log.scrollHeight; return el; };
+  async function send() {
+    const question = q.value.trim(); if (!question || busy || !guard()) return;
+    const c = creds(); if (needKey(c)) { status.textContent = t('ai_need_key'); return; }
+    busy = true; sendBtn.disabled = true; status.textContent = t('ai_working'); let wait;
+    try {
+      if (text === null) text = await docText(d, status);
+      bubble('user', question); q.value = ''; wait = bubble('ai', '…');
+      const raw = await ai.callModel({ ...c, system: ai.CHAT_SYSTEM, maxTokens: 3000, prompt: ai.buildChatPrompt(text, question, history) });
+      const ans = String(raw).trim(); wait.innerHTML = fmt(ans); history.push({ role: 'user', text: question }, { role: 'ai', text: ans }); status.textContent = ''; log.scrollTop = log.scrollHeight;
+    } catch (e) { if (wait) wait.remove(); console.error(e); status.textContent = errMsg(e); }
+    finally { busy = false; sendBtn.disabled = false; }
+  }
+  const sendBtn = h('button', { class: 'btn', type: 'button', onclick: send, html: icon('ai') + `<span>${t('ai_ask_send')}</span>` });
+  q.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
+  const chips = h('div', { class: 'row wrap gap-s mb' }, ['ai_sugg_sum', 'ai_sugg_key', 'ai_sugg_terms', 'ai_sugg_quiz'].map((k) => h('button', { class: 'btn small ghost', type: 'button', onclick: () => { q.value = t(k); send(); } }, t(k))));
+  modal({ title: `${t('ai_ask_title')} — ${d.name}`, wide: true, body: h('div', null, chips, log, h('div', { class: 'field mt' }, q), h('div', { class: 'row gap-s' }, sendBtn), status), actions: [{ label: t('close'), kind: 'ghost' }] });
+}
+
+// ---------- generate cards / questions ----------
+async function aiGenerate({ kind, doc = null, deckId = null, onDone } = {}) {
+  if (!guard()) return;
+  const [allDocs, decks, subjects] = await Promise.all([db.getAll('documents'), db.getAll('decks'), db.getAll('subjects')]);
+  const docs = allDocs.filter((x) => KINDS.includes(x.kind));
+  const docSel = h('select', null, h('option', { value: '' }, t('ai_paste_instead')), docs.map((x) => h('option', { value: x.id, selected: !!doc && x.id === doc.id }, `${x.name} (${x.kind.toUpperCase()})`)));
+  const paste = h('textarea', { rows: 3, placeholder: t('ai_paste_ph') });
+  const count = h('input', { type: 'number', min: 3, max: 60, value: kind === 'cards' ? 15 : 10 });
+  const deckSel = h('select', null, h('option', { value: '' }, t('ai_new_deck')), decks.map((x) => h('option', { value: x.id, selected: x.id === deckId }, x.name)));
+  const subjSel = h('select', null, h('option', { value: '' }, t('none')), subjects.map((x) => h('option', { value: x.id, selected: !!doc && x.id === doc.subjectId }, x.name)));
+  const diff = h('select', null, ['mixed', 'easy', 'medium', 'hard'].map((x) => h('option', { value: x }, x === 'mixed' ? t('ai_mixed') : t('diff_' + x))));
+  const typeBoxes = ['mcq', 'tf', 'short', 'blank'].map((k) => { const cb = h('input', { type: 'checkbox', checked: true, value: k }); return { k, cb, el: h('label', { class: 'row gap-s' }, cb, h('span', null, t('qt_' + k))) }; });
+  const out = h('div', { class: 'mt' }); const status = h('div', { class: 'small muted mt-s' });
+  const genBtn = h('button', { class: 'btn', type: 'button', onclick: run, html: icon('ai') + `<span>${t('ai_generate')}</span>` });
+  const form = h('div', null, h('div', { class: 'field' }, h('label', null, t('ai_source')), docSel), h('div', { class: 'field' }, paste),
+    kind === 'cards'
+      ? h('div', { class: 'grid cols-2' }, h('div', { class: 'field' }, h('label', null, t('ai_count')), count), h('div', { class: 'field' }, h('label', null, t('ai_target_deck')), deckSel))
+      : h('div', null, h('div', { class: 'grid cols-3' }, h('div', { class: 'field' }, h('label', null, t('ai_count')), count), h('div', { class: 'field' }, h('label', null, t('difficulty')), diff), h('div', { class: 'field' }, h('label', null, t('subject')), subjSel)), h('div', { class: 'row wrap gap mb' }, typeBoxes.map((x) => x.el))),
+    h('div', { class: 'row mt' }, genBtn), status, out);
+  const m = modal({ title: t(kind === 'cards' ? 'ai_gen_cards_btn' : 'ai_gen_q_btn'), wide: true, body: form, actions: [{ label: t('close'), kind: 'ghost' }] });
+
+  async function run() {
+    if (!guard()) return; out.textContent = ''; const c = creds(); if (needKey(c)) { status.textContent = t('ai_need_key'); return; }
+    genBtn.disabled = true; status.textContent = t('ai_working');
+    try {
+      let text; let src = null;
+      if (paste.value.trim().length > 50) text = paste.value;
+      else { src = docs.find((x) => x.id === docSel.value); if (!src) throw new ai.AiError('nosrc', 'no source'); text = await docText(src, status); }
+      const n = Math.max(3, Math.min(60, Number(count.value) || 10)); const types = typeBoxes.filter((x) => x.cb.checked).map((x) => x.k);
+      if (kind === 'questions' && !types.length) { status.textContent = t('ai_pick_type'); return; }
+      status.textContent = t('ai_working');
+      const items = await ai.generateChunked({ kind, text, n, types, difficulty: diff.value, ...c, onProgress: (i, k) => { status.textContent = k > 1 ? t('ai_progress', { i, n: k }) : t('ai_working'); } });
+      status.textContent = ''; preview(items, src);
+    } catch (e) { console.error(e); status.textContent = errMsg(e); }
+    finally { genBtn.disabled = false; }
+  }
+  const qLabel = (q) => (q.type === 'blank' ? q.text.replace(/\[\[([^\]|]+)[^\]]*\]\]/g, '[$1]') : q.text);
+  function preview(items, src) {
+    out.textContent = '';
+    const boxes = items.map((it) => ({ it, cb: h('input', { type: 'checkbox', checked: true }) }));
+    out.append(h('div', { class: 'small muted mb' }, t('ai_review_hint')), h('div', { style: { maxHeight: '40vh', overflowY: 'auto' } }, boxes.map(({ it, cb }) => h('label', { class: 'list-item', style: { alignItems: 'flex-start', gap: '10px' } }, cb,
+      kind === 'cards'
+        ? h('div', { class: 'grow', style: { direction: 'auto' } }, h('b', null, it.front), h('div', { class: 'small muted' }, it.back))
+        : h('div', { class: 'grow' }, h('div', { class: 'small muted' }, `${t('qt_' + it.type)} · ${t('diff_' + it.difficulty)}`), h('div', { style: { direction: 'auto' } }, qLabel(it)),
+          it.type === 'mcq' ? h('ol', { class: 'small muted', style: { margin: '4px 0 0', paddingInlineStart: '20px' } }, it.options.map((o, i) => h('li', { style: i === it.correct ? { fontWeight: 700 } : null }, o))) : null,
+          it.type === 'tf' ? h('div', { class: 'small muted' }, it.correct ? t('true') : t('false')) : null, it.type === 'short' ? h('div', { class: 'small muted' }, it.answers.join(' | ')) : null)))),
+      h('div', { class: 'row mt' }, h('button', { class: 'btn', type: 'button', onclick: () => save(boxes.filter((x) => x.cb.checked).map((x) => x.it), src), html: icon('check') + `<span>${t(kind === 'cards' ? 'ai_save_cards' : 'ai_save_questions')}</span>` })));
+  }
+  async function save(pick, src) {
+    if (!pick.length) return;
+    try {
+      if (kind === 'cards') {
+        let deck = deckSel.value ? decks.find((x) => x.id === deckSel.value) : null;
+        if (!deck) { const name = (src && src.name) || (doc && doc.name) || t('ai_deck_default'); const all = await db.getAll('decks'); deck = all.find((x) => x.name === name && !x.parentId) || await db.create('decks', { name, parentId: null }, 'deck'); }
+        const now = Date.now();
+        for (const cd of pick) await db.create('cards', { deckId: deck.id, noteId: db.uid('note'), guid: db.uid('g').slice(2), ord: 0, type: 'basic', fields: { front: esc(cd.front), back: esc(cd.back) }, tags: ['ai-generated'], ...newSchedule(now) }, 'card');
+        toast(t('ai_cards_made', { n: pick.length, d: deck.name }), 'ok'); m.close(); if (onDone) onDone(); else go('flashcards/deck/' + deck.id);
+      } else {
+        const sid = subjSel.value || (src && src.subjectId) || null;
+        for (const q of pick) await db.create('questions', { ...q, subjectId: sid, source: 'ai' }, 'q');
+        toast(t('ai_saved_questions', { n: pick.length }), 'ok'); m.close(); if (onDone) onDone(); else go('exams');
+      }
+    } catch (e) { console.error(e); status.textContent = errMsg(e); }
+  }
 }
 
 };
@@ -1444,6 +1644,7 @@ async function render(root) {
 
 };
 __d['js/features/exams/exams.js'] = function(exports){'use strict';
+const { aiAvailable, aiMenu, aiTileBtn, aiPageBtn, aiGenBtn } = __r('js/features/ai/ai-actions.js');
 Object.defineProperty(exports,'render',{enumerable:true,get:()=>render});
 const db = __r('js/database/db.js');
 const { h, esc, minutesToHM, shuffle, sanitizeHtml, download } = __r('js/services/utils.js');
@@ -1467,7 +1668,7 @@ const typeLabel = (x) => t('qt_' + x);
 // ============ HOME: exams, question bank, history ============
 async function home(root) {
   let tab = 'exams'; const body = h('div');
-  root.append(pageHead(t('nav_exams'), t('exams_sub'), h('button', { class: 'btn ghost', onclick: () => importQuestionsTxt(draw), html: icon('upload') + `<span>${getLang() === 'ar' ? 'استيراد TXT' : 'Import TXT'}</span>` }), h('button', { class: 'btn ghost', onclick: () => questionEditor(null), html: icon('plus') + `<span>${t('add_question')}</span>` }), h('button', { class: 'btn', onclick: () => examEditor(null), html: icon('plus') + `<span>${t('create_exam')}</span>` })), body);
+  root.append(pageHead(t('nav_exams'), t('exams_sub'), aiGenBtn('questions', { onDone: () => draw() }), h('button', { class: 'btn ghost', onclick: () => importQuestionsTxt(draw), html: icon('upload') + `<span>${getLang() === 'ar' ? 'استيراد TXT' : 'Import TXT'}</span>` }), h('button', { class: 'btn ghost', onclick: () => questionEditor(null), html: icon('plus') + `<span>${t('add_question')}</span>` }), h('button', { class: 'btn', onclick: () => examEditor(null), html: icon('plus') + `<span>${t('create_exam')}</span>` })), body);
 
   async function draw() {
     const [exams, questions, attempts, subjects] = await Promise.all([db.getAll('exams'), db.getAll('questions'), db.getAll('attempts'), listSubjects()]);
@@ -1805,6 +2006,7 @@ const deckLabel = (d, all) => { const parts = []; let x = d; let g = 0; while (x
 
 };
 __d['js/features/flashcards/flashcards.js'] = function(exports){'use strict';
+const { aiAvailable, aiMenu, aiTileBtn, aiPageBtn, aiGenBtn } = __r('js/features/ai/ai-actions.js');
 Object.defineProperty(exports,'render',{enumerable:true,get:()=>render});
 const db = __r('js/database/db.js');
 const { h, download, pickFiles, debounce, sanitizeHtml, readFileAsText, safeFileName, ymd, esc } = __r('js/services/utils.js');
@@ -1836,6 +2038,7 @@ const descendants = (decks, id) => { const out = new Set([id]); let g = true; wh
 async function decksView(root) {
   const prefs = getPrefs(); const body = h('div');
   root.append(pageHead(t('nav_flashcards'), t('flashcards_sub'),
+    aiGenBtn('cards', { onDone: () => draw() }),
     h('button', { class: 'btn ghost', onclick: () => go('flashcards/browse'), html: icon('search') + `<span>${t('browse')}</span>` }),
     h('button', { class: 'btn ghost', onclick: importFlow, html: icon('upload') + `<span>${t('import')}</span>` }),
     h('button', { class: 'btn', onclick: () => newDeck(null), html: icon('plus') + `<span>${t('new_deck')}</span>` })), body);
@@ -1913,6 +2116,7 @@ async function deckView(root, id) {
   root.append(h('div', { class: 'crumbs' }, h('button', { onclick: () => go('flashcards') }, t('nav_flashcards')), ' / ', h('b', null, deck.name)),
     pageHead(deck.name, null, h('button', { class: 'btn ghost', onclick: menu, html: icon('more') + `<span>${t('manage')}</span>` }),
       h('button', { class: 'btn ghost', onclick: () => go(`flashcards/browse?deck=${id}`), html: icon('list') + `<span>${t('browse')}</span>` }),
+      aiGenBtn('cards', { deckId: id, onDone: () => draw() }),
       h('button', { class: 'btn secondary', onclick: () => openCardEditor({ deckId: id, onDone: draw }), html: icon('plus') + `<span>${t('add_card')}</span>` }),
       h('button', { class: 'btn', id: 'study-btn', onclick: () => go(`flashcards/review/${id}`), html: icon('play') + `<span>${t('study')}</span>` })), body);
   async function draw() {
@@ -2043,6 +2247,7 @@ async function reviewView(root, deckId) {
 
 };
 __d['js/features/library/library.js'] = function(exports){'use strict';
+const { aiAvailable, aiMenu, aiTileBtn, aiPageBtn, aiGenBtn } = __r('js/features/ai/ai-actions.js');
 Object.defineProperty(exports,'render',{enumerable:true,get:()=>render});
 const db = __r('js/database/db.js');
 const { h, fmtBytes, fmtDate, pickFiles, download, debounce, readFileAsBuffer, sanitizeHtml, esc } = __r('js/services/utils.js');
@@ -2191,7 +2396,7 @@ async function docGrid(docs, subjects, view, onChange) {
     const subj = subjects.find((s) => s.id === d.subjectId);
     grid.append(h('div', { class: 'card tile click', onclick: () => go(`library/doc/${d.id}`) },
       h('div', { class: 'cover', style: await coverStyle(d, 'book'), html: d.coverBlobId || d.kind === 'image' ? '' : icon(KIND_ICON[d.kind] || 'file') }),
-      h('button', { class: 'fav' + (d.favorite ? ' on' : ''), 'aria-label': t('favorite'), onclick: async (e) => { e.stopPropagation(); await db.put('documents', { ...d, favorite: d.favorite ? 0 : 1 }); e.currentTarget.classList.toggle('on'); d.favorite = d.favorite ? 0 : 1; onChange && onChange(); }, html: icon('star') }),
+      h('button', { class: 'fav' + (d.favorite ? ' on' : ''), 'aria-label': t('favorite'), onclick: async (e) => { e.stopPropagation(); await db.put('documents', { ...d, favorite: d.favorite ? 0 : 1 }); e.currentTarget.classList.toggle('on'); d.favorite = d.favorite ? 0 : 1; onChange && onChange(); }, html: icon('star') }), aiTileBtn(d),
       h('div', { class: 'body grow' }, h('b', { class: 'ellipsis', style: { display: 'block' } }, d.name),
         h('div', { class: 'small muted' }, `${d.kind.toUpperCase()} · ${fmtBytes(d.size || 0)}${subj ? ' · ' + subj.name : ''}`),
         d.progress ? h('div', { class: 'mt-s' }, progressBar(d.progress)) : null)));
@@ -2265,6 +2470,7 @@ async function subjectView(root, subjectId, folderId) {
   function docMenu(d) {
     actionSheet(d.name, [
       { icon: 'eye', label: t('open'), run: () => go(`library/doc/${d.id}`) },
+      ...(aiAvailable(d) ? [{ icon: 'ai', label: t('ai_btn'), run: () => aiMenu(d) }] : []),
       { icon: 'star', label: d.favorite ? t('unfavorite') : t('favorite'), run: async () => { await db.put('documents', { ...d, favorite: d.favorite ? 0 : 1 }); draw(); } },
       { icon: 'edit', label: t('rename'), run: async () => { const r = await formDialog({ title: t('rename'), fields: [{ name: 'name', label: t('name'), value: d.name, required: true }] }); if (r) { await db.update('documents', d.id, { name: r.name }); draw(); } } },
       { icon: 'move', label: t('move'), run: async () => { const dest = await folderPicker(d.subjectId); if (dest) { await repo.moveDocument(d.id, dest); draw(); } } },
@@ -3125,7 +3331,7 @@ async function viewDoc(root, id) {
       tasks.length ? tasks.map((k) => h('a', { class: 'list-item', href: `#/planner?date=${k.date}`, html: icon(k.done ? 'check' : 'clock') + `<span class="grow">${esc(k.title)}</span><span class="small muted">${esc(k.date)}</span>` })) : h('p', { class: 'muted' }, t('no_linked_tasks'))));
 
   root.append(h('div', { class: 'crumbs' }, h('button', { onclick: back, html: icon(getLang() === 'ar' ? 'chevR' : 'chevL') + ` ${t('back')}` })),
-    pageHead(d.name, subject?.name, h('button', { class: 'btn ghost', onclick: async () => { await db.put('documents', { ...d, favorite: d.favorite ? 0 : 1 }); d.favorite = d.favorite ? 0 : 1; toast(d.favorite ? t('favorite') : t('unfavorite')); }, html: icon('star') + `<span>${t('favorite')}</span>` }),
+    pageHead(d.name, subject?.name, aiPageBtn(d), h('button', { class: 'btn ghost', onclick: async () => { await db.put('documents', { ...d, favorite: d.favorite ? 0 : 1 }); d.favorite = d.favorite ? 0 : 1; toast(d.favorite ? t('favorite') : t('unfavorite')); }, html: icon('star') + `<span>${t('favorite')}</span>` }),
       h('button', { class: 'btn ghost', onclick: () => blob && download(blob, d.fileName || d.name), html: icon('download') + `<span>${t('save_copy')}</span>` })),
     h('div', { class: 'split', style: { gridTemplateColumns: '1fr 340px' } }, content, side));
 }
@@ -3971,11 +4177,20 @@ Object.defineProperty(exports,'AiError',{enumerable:true,get:()=>AiError});
 Object.defineProperty(exports,'callClaude',{enumerable:true,get:()=>callClaude});
 Object.defineProperty(exports,'callGemini',{enumerable:true,get:()=>callGemini});
 Object.defineProperty(exports,'callModel',{enumerable:true,get:()=>callModel});
+Object.defineProperty(exports,'listPuterModels',{enumerable:true,get:()=>listPuterModels});
+Object.defineProperty(exports,'generateChunked',{enumerable:true,get:()=>generateChunked});
+Object.defineProperty(exports,'CHAT_SYSTEM',{enumerable:true,get:()=>CHAT_SYSTEM});
+Object.defineProperty(exports,'buildChatPrompt',{enumerable:true,get:()=>buildChatPrompt});
 Object.defineProperty(exports,'extractPdfText',{enumerable:true,get:()=>extractPdfText});
 // AI question / flashcard generation through the Anthropic Messages API.
 // Needs internet and the user's own API key (stored only in this browser's localStorage, never in backups).
 // Everything else in the app stays offline. Parsing/validation here is pure and unit-tested.
 const PROVIDERS = {
+  auto: { label: 'تلقائي — مجاني بدون مفتاح / Auto (free, no key)', noKey: true, keyHint: '', keyUrl: '', models: [{ id: 'auto', label: 'Auto (best available)' }] },
+  pollinations: { label: 'Pollinations (free, no key)', noKey: true, keyHint: '', keyUrl: '', models: [{ id: 'openai-fast', label: 'GPT-OSS 20B (openai-fast)' }, { id: 'openai', label: 'OpenAI' }, { id: 'mistral', label: 'Mistral' }] },
+  keyless: { label: 'KeylessAI proxy (free, no key)', noKey: true, keyHint: '', keyUrl: '', models: [{ id: 'gpt-4o-mini', label: 'gpt-4o-mini' }, { id: 'gpt-4o', label: 'gpt-4o' }] },
+  puter: { label: 'Puter (free, no key)', noKey: true, keyHint: '', keyUrl: 'puter.com', models: [
+    { id: 'gpt-5-nano', label: 'GPT-5 nano' }, { id: 'gpt-4o-mini', label: 'GPT-4o mini' }, { id: 'deepseek-chat', label: 'DeepSeek Chat' }, { id: 'claude-sonnet-4-5', label: 'Claude Sonnet' }] },
   gemini: { label: 'Google Gemini', keyHint: 'AIza…', keyUrl: 'aistudio.google.com/apikey', models: [
     { id: 'gemini-4-argon', label: 'Gemini 4 Argon' }, { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' }] },
   anthropic: { label: 'Anthropic Claude', keyHint: 'sk-ant-…', keyUrl: 'console.anthropic.com', models: [
@@ -3983,8 +4198,8 @@ const PROVIDERS = {
 };
 const MAX_SOURCE_CHARS = 60000;
 const ls = { get: (k) => { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }, set: (k, v) => { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); } catch (e) { /* ignore */ } } };
-const getProvider = () => (PROVIDERS[ls.get('fariss_ai_provider')] ? ls.get('fariss_ai_provider') : 'gemini');
-const setProvider = (p) => ls.set('fariss_ai_provider', p);
+const getProvider = () => (PROVIDERS[ls.get('fariss_ai_provider2')] ? ls.get('fariss_ai_provider2') : 'auto');
+const setProvider = (p) => ls.set('fariss_ai_provider2', p);
 const getKey = (p = getProvider()) => ls.get('fariss_ai_key_' + p) || (p === 'anthropic' ? ls.get('fariss_ai_key') : '');
 const setKey = (k, p = getProvider()) => ls.set('fariss_ai_key_' + p, (k || '').trim());
 const getModel = (p = getProvider()) => ls.get('fariss_ai_model_' + p) || PROVIDERS[p].models[0].id;
@@ -4005,6 +4220,20 @@ function buildCardsPrompt(text, { n = 10 } = {}) {
   return `Create ${n} flashcards from the source text below. Each card tests one important fact or concept.\nReturn a JSON array of {"front":"question or term","back":"short, accurate answer"}.\n\nSOURCE TEXT:\n"""\n${String(text).slice(0, MAX_SOURCE_CHARS)}\n"""`;
 }
 
+const CHAT_SYSTEM = 'You are a patient, friendly university tutor helping a student understand a study sheet (lecture notes). Answer the student\'s question using the SHEET EXCERPTS provided. Explain step by step in simple words, give a short example or analogy when it helps, and define difficult terms. Reply in the same language and dialect style as the student\'s question (if Arabic, use clear simple Arabic and keep medical/technical terms in English in brackets). If the excerpts do not contain the answer, say so clearly first, then give a brief general explanation and label it as "from general knowledge, not from your sheet". Never invent facts or quotes. Keep answers focused; use short lists only when useful.';
+function pickExcerpts(text, question, budget = 14000) {
+  text = String(text || ''); if (text.length <= budget) return text;
+  const chunks = []; const size = 2500;
+  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
+  const terms = [...new Set(String(question).toLowerCase().normalize('NFKC').split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 2))];
+  const scored = chunks.map((c, i) => { const lc = c.toLowerCase(); let sc = 0; for (const w of terms) { let k = lc.indexOf(w); while (k >= 0 && sc < 400) { sc++; k = lc.indexOf(w, k + w.length); } } return { i, c, sc }; });
+  const top = scored.slice().sort((a, b) => b.sc - a.sc || a.i - b.i).slice(0, Math.max(1, Math.floor(budget / size)));
+  return top.sort((a, b) => a.i - b.i).map((x) => x.c).join('\n[...]\n');
+}
+function buildChatPrompt(text, question, history = []) {
+  const hist = history.slice(-6).map((m) => (m.role === 'user' ? 'Student: ' : 'Tutor: ') + m.text.slice(0, 1500)).join('\n');
+  return `SHEET EXCERPTS:\n"""\n${pickExcerpts(text, question)}\n"""\n\n${hist ? 'CONVERSATION SO FAR:\n' + hist + '\n\n' : ''}STUDENT QUESTION:\n${String(question).slice(0, 2000)}\n\nAnswer now:`;
+}
 function extractJson(raw) {
   let s = String(raw || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   const a = s.indexOf('['), b = s.lastIndexOf(']');
@@ -4037,14 +4266,14 @@ function parseCards(raw) {
 }
 
 class AiError extends Error { constructor(code, msg) { super(msg); this.code = code; } }
-async function callClaude({ apiKey, model, prompt, maxTokens = 6000, signal }) {
+async function callClaude({ apiKey, model, prompt, maxTokens = 6000, signal, system = SYSTEM }) {
   if (!apiKey) throw new AiError('nokey', 'API key missing');
   let res;
   try {
     res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST', signal,
       headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
-      body: JSON.stringify({ model, max_tokens: maxTokens, system: SYSTEM, messages: [{ role: 'user', content: prompt }] })
+      body: JSON.stringify({ model, max_tokens: maxTokens, system, messages: [{ role: 'user', content: prompt }] })
     });
   } catch (e) { if (e.name === 'AbortError') throw e; throw new AiError('network', 'network error'); }
   if (!res.ok) throw await httpError(res);
@@ -4053,13 +4282,13 @@ async function callClaude({ apiKey, model, prompt, maxTokens = 6000, signal }) {
 }
 
 const httpError = async (res) => { let m = ''; try { m = (await res.json())?.error?.message || ''; } catch (e) { /* ignore */ } return new AiError(res.status === 401 || res.status === 403 || (res.status === 400 && /api key|API_KEY/i.test(m)) ? 'auth' : res.status === 429 ? 'rate' : res.status === 404 ? 'model' : 'http', m || `HTTP ${res.status}`); };
-async function callGemini({ apiKey, model, prompt, maxTokens = 12000, signal }) {
+async function callGemini({ apiKey, model, prompt, maxTokens = 12000, signal, system = SYSTEM }) {
   if (!apiKey) throw new AiError('nokey', 'API key missing');
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST', signal, headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, responseMimeType: 'application/json' } })
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: system === SYSTEM ? { maxOutputTokens: maxTokens, responseMimeType: 'application/json' } : { maxOutputTokens: maxTokens } })
     });
   } catch (e) { if (e.name === 'AbortError') throw e; throw new AiError('network', 'network error'); }
   if (!res.ok) throw await httpError(res);
@@ -4068,7 +4297,126 @@ async function callGemini({ apiKey, model, prompt, maxTokens = 12000, signal }) 
   if (!text) throw new AiError('parse', j.promptFeedback?.blockReason || 'empty reply');
   return text;
 }
-const callModel = ({ provider, ...rest }) => (provider === 'anthropic' ? callClaude(rest) : callGemini(rest));
+// OpenAI-compatible keyless endpoints (public, CORS-open). Used directly and as the 'auto' fallback chain.
+async function callOpenAICompat(url, { model, prompt, signal, maxTokens = 4000, system = SYSTEM }) {
+  let res;
+  try {
+    res = await fetch(url, { method: 'POST', signal, headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, max_tokens: maxTokens, stream: false, messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }] }) });
+  } catch (e) { if (e.name === 'AbortError') throw e; throw new AiError('network', 'network error'); }
+  if (!res.ok) throw await httpError(res);
+  let j; try { j = await res.json(); } catch (e) { throw new AiError('parse', 'bad reply'); }
+  const c = j.choices?.[0]?.message?.content;
+  const text = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => x?.text || '').join('') : '';
+  if (!text.trim()) throw new AiError('parse', 'empty reply');
+  return text;
+}
+const callPollinations = (o) => callOpenAICompat('https://text.pollinations.ai/openai/chat/completions', { ...o, model: o.model && o.model !== 'auto' ? o.model : 'openai-fast' });
+const callKeyless = (o) => callOpenAICompat('https://keylessai.thryx.workers.dev/v1/chat/completions', { ...o, model: o.model && o.model !== 'auto' ? o.model : 'gpt-4o-mini' });
+async function callAuto(o) {
+  const step = async (fn, ms) => {
+    const ctl = new AbortController(); const link = () => ctl.abort(); if (o.signal) o.signal.addEventListener('abort', link, { once: true }); const tm = setTimeout(() => ctl.abort(), ms);
+    try { return await fn({ ...o, signal: ctl.signal }); }
+    catch (e) { if (e.name === 'AbortError' && !(o.signal && o.signal.aborted)) throw new AiError('network', 'timeout'); throw e; }
+    finally { clearTimeout(tm); if (o.signal) o.signal.removeEventListener('abort', link); }
+  };
+  const chain = [() => step((x) => callPollinations({ ...x, model: 'openai-fast' }), 60000), () => step((x) => callKeyless({ ...x, model: 'gpt-4o-mini' }), 60000), () => step((x) => callPuter({ ...x, model: 'gpt-4o-mini' }), 70000)];
+  let last;
+  for (const fn of chain) {
+    try { return await fn(); } catch (e) { if (e.name === 'AbortError') throw e; last = e; }
+  }
+  throw new AiError(last && last.code === 'rate' ? 'rate' : 'network', 'all free providers failed' + (last && last.message ? ': ' + last.message : ''));
+}
+let puterLoading = null;
+function loadPuter() {
+  if (globalThis.puter && globalThis.puter.ai) return Promise.resolve(globalThis.puter);
+  if (puterLoading) return puterLoading;
+  puterLoading = new Promise((resolve, reject) => {
+    const sc = document.createElement('script'); sc.src = 'https://js.puter.com/v2/';
+    sc.onload = () => (globalThis.puter && globalThis.puter.ai ? resolve(globalThis.puter) : reject(new AiError('network', 'puter not ready')));
+    sc.onerror = () => { puterLoading = null; sc.remove(); reject(new AiError('network', 'network error')); };
+    document.head.appendChild(sc);
+  });
+  return puterLoading;
+}
+// Puter.js: no API key, no subscription (the "user pays" model: Puter's free account covers usage). Needs internet.
+async function callPuter({ model, prompt, signal, system = SYSTEM }) {
+  const puter = await loadPuter();
+  if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  let r;
+  try {
+    r = await Promise.race([puter.ai.chat([{ role: 'system', content: system }, { role: 'user', content: prompt }], { model }),
+      new Promise((_, rej) => { if (signal) signal.addEventListener('abort', () => rej(new DOMException('Aborted', 'AbortError')), { once: true }); })]);
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    const m = (e && (e.message || e.error?.message || e.error || e.code)) || ''; const ms = String(m);
+    if (/auth|sign|login|denied|cancel|401|403/i.test(ms) || (e && e.code === 'auth_failed')) throw new AiError('auth', ms);
+    if (/429|rate|limit|quota|usage/i.test(ms)) throw new AiError('rate', ms);
+    if (/model|404|not found/i.test(ms)) throw new AiError('model', ms);
+    throw new AiError('http', ms || 'puter error');
+  }
+  const c = r?.message?.content ?? r?.content ?? r;
+  const text = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x) => (typeof x === 'string' ? x : x?.text || '')).join('') : (typeof r?.toString === 'function' && r.toString() !== '[object Object]' ? r.toString() : '');
+  if (!text.trim()) throw new AiError('parse', 'empty reply');
+  return text;
+}
+async function listPuterModels() {
+  try {
+    const puter = await loadPuter(); const l = await puter.ai.listModels();
+    const ids = (Array.isArray(l) ? l : []).map((x) => (typeof x === 'string' ? x : x?.id)).filter(Boolean);
+    return ids.filter((id) => !/image|tts|stt|whisper|embed|video|dall|moderation|audio|ocr/i.test(id)).slice(0, 80);
+  } catch (e) { return []; }
+}
+const dispatchModel = ({ provider, ...rest }) => (provider === 'anthropic' ? callClaude(rest) : provider === 'puter' ? callPuter(rest) : provider === 'pollinations' ? callPollinations(rest) : provider === 'keyless' ? callKeyless(rest) : provider === 'auto' ? callAuto(rest) : callGemini(rest));
+
+// ---- Load handling: max 2 parallel requests, per-attempt timeout, retry with backoff (network / rate-limit / server errors) ----
+let activeReq = 0; const waiters = [];
+const acquire = async () => { if (activeReq < 2) { activeReq++; return; } await new Promise((r) => waiters.push(r)); activeReq++; };
+const release = () => { activeReq--; const w = waiters.shift(); if (w) w(); };
+const sleep = (ms, signal) => new Promise((res, rej) => { const id = setTimeout(res, ms); if (signal) signal.addEventListener('abort', () => { clearTimeout(id); rej(new DOMException('Aborted', 'AbortError')); }, { once: true }); });
+async function callModel(opts) {
+  const { signal: outer, timeoutMs = 150000, retries = 3 } = opts;
+  await acquire();
+  try {
+    let lastErr;
+    for (let a = 0; a <= retries; a++) {
+      if (outer && outer.aborted) throw new DOMException('Aborted', 'AbortError');
+      const ctl = new AbortController(); let timedOut = false; const onAbort = () => ctl.abort(); if (outer) outer.addEventListener('abort', onAbort, { once: true });
+      const tm = setTimeout(() => { timedOut = true; ctl.abort(); }, timeoutMs);
+      try { return await dispatchModel({ ...opts, signal: ctl.signal }); }
+      catch (e0) {
+        let e = e0; if (e.name === 'AbortError') { if (timedOut) e = new AiError('network', 'timeout'); else throw e; }
+        lastErr = e; if (!['network', 'rate', 'http', 'parse'].includes(e.code) || a === retries) throw e;
+        await sleep(Math.min(1500 * 2 ** a, 9000) + Math.random() * 400, outer);
+      } finally { clearTimeout(tm); if (outer) outer.removeEventListener('abort', onAbort); }
+    }
+    throw lastErr;
+  } finally { release(); }
+}
+
+function splitChunks(text, size = 12000, max = 6) {
+  text = String(text || '').trim(); if (text.length <= size) return [text];
+  const parts = []; let i = 0;
+  while (i < text.length) { let end = Math.min(i + size, text.length); if (end < text.length) { const k = text.lastIndexOf('\n', end); if (k > i + size * 0.6) end = k; } parts.push(text.slice(i, end)); i = end; }
+  if (parts.length <= max) return parts;
+  const out = []; for (let k = 0; k < max; k++) out.push(parts[Math.floor(k * parts.length / max)]); return out;
+}
+// Long documents are split into parts (spread across the whole text) and generated part by part, so size is not a limit.
+async function generateChunked({ kind, text, n = 10, types, difficulty = 'mixed', provider, apiKey, model, onProgress, signal }) {
+  const chunks = splitChunks(text); const per = Math.max(2, Math.ceil(n / chunks.length)); const all = []; let lastErr;
+  for (let i = 0; i < chunks.length; i++) {
+    if (onProgress) onProgress(i + 1, chunks.length);
+    try {
+      const prompt = kind === 'cards' ? buildCardsPrompt(chunks[i], { n: per }) : buildQuestionsPrompt(chunks[i], { n: per, types, difficulty });
+      const raw = await callModel({ provider, apiKey, model, prompt, signal, maxTokens: 6000 });
+      all.push(...(kind === 'cards' ? parseCards(raw) : parseQuestions(raw, difficulty === 'mixed' ? 'medium' : difficulty)));
+    } catch (e) { if (e.name === 'AbortError' || ['auth', 'nokey', 'model'].includes(e.code)) throw e; lastErr = e; }
+  }
+  if (!all.length) throw lastErr || new AiError('parse', 'empty');
+  const seen = new Set(); const out = [];
+  for (const it of all) { const k = kind === 'cards' ? it.front : it.text; if (!seen.has(k)) { seen.add(k); out.push(it); } }
+  return out.slice(0, n);
+}
 
 async function extractPdfText(blob, maxChars = 400000) {
   const { loadPdfjs } = await Promise.resolve().then(() => __r('js/services/pdfjs-loader.js'));
@@ -5460,7 +5808,27 @@ store_notes: 'الملاحظات',
 store_prefs: 'الإعدادات',
 store_stats: 'الإحصائيات',
 pdf_page: 'صفحة', pdf_prev: 'الصفحة السابقة', pdf_next: 'الصفحة التالية', pdf_zoom_in: 'تكبير', pdf_zoom_out: 'تصغير', pdf_fit: 'ملاءمة العرض', pdf_search: 'بحث في PDF', pdf_searching: 'جارٍ البحث…', pdf_results: '{n} صفحة مطابقة', pdf_no_results: 'لا توجد نتائج', pdf_fullscreen: 'ملء الشاشة', pdf_password: 'ملف PDF هذا محمي بكلمة مرور. أدخل كلمة المرور:', pdf_wrong_password: 'كلمة المرور خاطئة. حاول مرة أخرى:',
-ai_gen_title: "توليد أسئلة وبطاقات بالذكاء الاصطناعي", ai_online_note: "هذه الميزة الوحيدة التي تحتاج إنترنت. يُرسل نص المستند الذي تختاره إلى المزوّد الذي تختاره (Google Gemini أو Anthropic) لتوليد الأسئلة، ومفتاحك يُحفظ في هذا الجهاز فقط ولا يدخل النسخ الاحتياطي.", ai_api_key: "مفتاح API (Anthropic)", ai_model: "النموذج", ai_source: "المصدر", ai_paste_instead: "— أو الصق نصاً أدناه —", ai_paste_ph: "الصق هنا النص الذي تريد توليد الأسئلة منه (اختياري إن اخترت مستنداً)", ai_what: "ماذا تريد؟", ai_gen_questions: "أسئلة امتحان", ai_gen_cards: "بطاقات مراجعة", ai_count: "العدد", ai_mixed: "متنوع", ai_generate: "ولّد", ai_working: "جارٍ التوليد… قد يستغرق دقيقة", ai_reading_pdf: "جارٍ قراءة نص ملف PDF…", ai_need_key: "أدخل مفتاح API أولاً.", ai_pick_type: "اختر نوع سؤال واحداً على الأقل.", ai_review_hint: "راجع النتائج وألغِ تحديد ما لا تريده قبل الحفظ.", ai_save_questions: "حفظ في بنك الأسئلة", ai_save_cards: "حفظ كبطاقات", ai_saved_questions: "تم حفظ {n} سؤالاً في بنك الأسئلة", ai_deck_default: "بطاقات الذكاء الاصطناعي", ai_err_network: "تعذّر الاتصال. تحتاج إنترنت لهذه الميزة.", ai_err_auth: "مفتاح API غير صالح أو غير مصرّح له.", ai_err_rate: "تجاوزت الحد المسموح مؤقتاً. حاول بعد قليل.", ai_err_nosrc: "اختر مستنداً أو الصق نصاً.", ai_err_notext: "لا يوجد نص قابل للقراءة في هذا المستند (قد يكون PDF ممسوحاً ضوئياً).", ai_err_parse: "لم يرجع النموذج أسئلة صالحة. جرّب مرة أخرى أو قلّل العدد.", ai_err_generic: "حدث خطأ: {msg}", 
+ai_gen_title: "توليد أسئلة وبطاقات بالذكاء الاصطناعي", ai_btn: "ذكاء اصطناعي",
+ai_offline: "الذكاء الاصطناعي يحتاج إنترنت. باقي التطبيق يعمل بدون إنترنت كالمعتاد.",
+ai_menu_ask: "اسأل عن الشيت واطلب الشرح",
+ai_menu_cards: "توليد بطاقات فلاش كارد",
+ai_menu_questions: "توليد أسئلة امتحان",
+ai_gen_cards_btn: "توليد بطاقات بالذكاء الاصطناعي",
+ai_gen_q_btn: "توليد أسئلة بالذكاء الاصطناعي",
+ai_target_deck: "حفظ البطاقات في",
+ai_new_deck: "— مجموعة جديدة باسم المستند —",
+ai_progress: "جارٍ المعالجة: الجزء {i} من {n}…",
+ai_sugg_sum: "لخّص لي هذا الشيت",
+ai_sugg_key: "اشرح لي أهم النقاط",
+ai_sugg_terms: "ما أهم المصطلحات وما معناها؟",
+ai_sugg_quiz: "اسألني 3 أسئلة لاختبار فهمي",
+ai_ask_title: "اسأل الشيت واطلب الشرح",
+ai_ask_desc: "اختر المستند (أو الصق نصاً) ثم اسأل عن أي نقطة فيه، وسيشرحها لك خطوة بخطوة اعتماداً على نص الشيت. اضغط Ctrl+Enter للإرسال.",
+ai_ask_ph: "مثال: اشرح لي ما معنى هذه الفقرة؟ أو: ما الفرق بين ... و ...؟",
+ai_ask_send: "اسأل",
+ai_ask_clear: "مسح المحادثة",
+ai_no_key_needed: "لا يحتاج مفتاح API ولا اشتراك. يجرّب التطبيق مزوّدين مجانيين تلقائياً (Pollinations ثم KeylessAI ثم Puter) ويحتاج إنترنت فقط.",
+ai_online_note: "هذه الميزة الوحيدة التي تحتاج إنترنت. يُرسل نص المستند الذي تختاره إلى المزوّد الذي تختاره (Puter المجاني بلا مفتاح، أو Google Gemini، أو Anthropic) لتوليد الأسئلة، ومفتاحك (إن استخدمت واحداً) يُحفظ في هذا الجهاز فقط ولا يدخل النسخ الاحتياطي.", ai_api_key: "مفتاح API", ai_model: "النموذج", ai_source: "المصدر", ai_paste_instead: "— أو الصق نصاً أدناه —", ai_paste_ph: "الصق هنا النص الذي تريد توليد الأسئلة منه (اختياري إن اخترت مستنداً)", ai_what: "ماذا تريد؟", ai_gen_questions: "أسئلة امتحان", ai_gen_cards: "بطاقات مراجعة", ai_count: "العدد", ai_mixed: "متنوع", ai_generate: "ولّد", ai_working: "جارٍ التوليد… قد يستغرق دقيقة", ai_reading_pdf: "جارٍ قراءة نص ملف PDF…", ai_need_key: "أدخل مفتاح API أولاً.", ai_pick_type: "اختر نوع سؤال واحداً على الأقل.", ai_review_hint: "راجع النتائج وألغِ تحديد ما لا تريده قبل الحفظ.", ai_save_questions: "حفظ في بنك الأسئلة", ai_save_cards: "حفظ كبطاقات", ai_saved_questions: "تم حفظ {n} سؤالاً في بنك الأسئلة", ai_deck_default: "بطاقات الذكاء الاصطناعي", ai_err_network: "تعذّر الاتصال. تحتاج إنترنت لهذه الميزة.", ai_err_auth: "مفتاح API غير صالح أو غير مصرّح له.", ai_err_rate: "تجاوزت الحد المسموح مؤقتاً. حاول بعد قليل.", ai_err_nosrc: "اختر مستنداً أو الصق نصاً.", ai_err_notext: "لا يوجد نص قابل للقراءة في هذا المستند (قد يكون PDF ممسوحاً ضوئياً).", ai_err_parse: "لم يرجع النموذج أسئلة صالحة. جرّب مرة أخرى أو قلّل العدد.", ai_err_generic: "حدث خطأ: {msg}", 
 ai_provider: "المزوّد", ai_custom_model: "أو اكتب اسم نموذج آخر (اختياري)", ai_get_key: "احصل على المفتاح من {url}", ai_err_model: "اسم النموذج غير صحيح أو غير متاح لحسابك. جرّب نموذجاً آخر.", 
 };
 
@@ -5512,7 +5880,27 @@ store_notes: 'notes',
 store_prefs: 'settings',
 store_stats: 'statistics',
 pdf_page: 'Page', pdf_prev: 'Previous page', pdf_next: 'Next page', pdf_zoom_in: 'Zoom in', pdf_zoom_out: 'Zoom out', pdf_fit: 'Fit width', pdf_search: 'Search in PDF', pdf_searching: 'Searching…', pdf_results: '{n} page(s) match', pdf_no_results: 'No results', pdf_fullscreen: 'Full screen', pdf_password: 'This PDF is password protected. Enter the password:', pdf_wrong_password: 'Wrong password. Try again:',
-ai_gen_title: "Generate questions & flashcards with AI", ai_online_note: "This is the only feature that needs internet. The text of the document you pick is sent to the AI provider you choose (Google Gemini or Anthropic); your key stays on this device only and is never part of backups.", ai_api_key: "API key (Anthropic)", ai_model: "Model", ai_source: "Source", ai_paste_instead: "— or paste text below —", ai_paste_ph: "Paste the text to generate from (optional if you pick a document)", ai_what: "What to create", ai_gen_questions: "Exam questions", ai_gen_cards: "Flashcards", ai_count: "Count", ai_mixed: "Mixed", ai_generate: "Generate", ai_working: "Generating… this can take a minute", ai_reading_pdf: "Reading PDF text…", ai_need_key: "Enter your API key first.", ai_pick_type: "Pick at least one question type.", ai_review_hint: "Review the results and untick anything you do not want before saving.", ai_save_questions: "Save to question bank", ai_save_cards: "Save as flashcards", ai_saved_questions: "Saved {n} questions to the question bank", ai_deck_default: "AI cards", ai_err_network: "Could not connect. This feature needs internet.", ai_err_auth: "The API key is invalid or not authorized.", ai_err_rate: "Rate limit reached for now. Try again shortly.", ai_err_nosrc: "Pick a document or paste text.", ai_err_notext: "No readable text in this document (it may be a scanned PDF).", ai_err_parse: "The model did not return valid questions. Try again or lower the count.", ai_err_generic: "Something went wrong: {msg}", 
+ai_gen_title: "Generate questions & flashcards with AI", ai_btn: "AI",
+ai_offline: "AI needs internet. The rest of the app works offline as usual.",
+ai_menu_ask: "Ask about this sheet & get explanations",
+ai_menu_cards: "Generate flashcards",
+ai_menu_questions: "Generate exam questions",
+ai_gen_cards_btn: "Generate cards with AI",
+ai_gen_q_btn: "Generate questions with AI",
+ai_target_deck: "Save cards to",
+ai_new_deck: "— New deck named after the document —",
+ai_progress: "Processing part {i} of {n}…",
+ai_sugg_sum: "Summarize this sheet for me",
+ai_sugg_key: "Explain the key points",
+ai_sugg_terms: "What are the key terms and what do they mean?",
+ai_sugg_quiz: "Ask me 3 questions to test my understanding",
+ai_ask_title: "Ask your sheet & get explanations",
+ai_ask_desc: "Pick a document (or paste text), then ask about any point and get a step-by-step explanation based on the sheet. Press Ctrl+Enter to send.",
+ai_ask_ph: "e.g. Explain this paragraph in simple words, or: what is the difference between ... and ...?",
+ai_ask_send: "Ask",
+ai_ask_clear: "Clear chat",
+ai_no_key_needed: "No API key and no subscription needed. The app tries free providers automatically (Pollinations, then KeylessAI, then Puter); internet required.",
+ai_online_note: "This is the only feature that needs internet. The text of the document you pick is sent to the AI provider you choose (free keyless Puter, Google Gemini or Anthropic); your key stays on this device only and is never part of backups.", ai_api_key: "API key", ai_model: "Model", ai_source: "Source", ai_paste_instead: "— or paste text below —", ai_paste_ph: "Paste the text to generate from (optional if you pick a document)", ai_what: "What to create", ai_gen_questions: "Exam questions", ai_gen_cards: "Flashcards", ai_count: "Count", ai_mixed: "Mixed", ai_generate: "Generate", ai_working: "Generating… this can take a minute", ai_reading_pdf: "Reading PDF text…", ai_need_key: "Enter your API key first.", ai_pick_type: "Pick at least one question type.", ai_review_hint: "Review the results and untick anything you do not want before saving.", ai_save_questions: "Save to question bank", ai_save_cards: "Save as flashcards", ai_saved_questions: "Saved {n} questions to the question bank", ai_deck_default: "AI cards", ai_err_network: "Could not connect. This feature needs internet.", ai_err_auth: "The API key is invalid or not authorized.", ai_err_rate: "Rate limit reached for now. Try again shortly.", ai_err_nosrc: "Pick a document or paste text.", ai_err_notext: "No readable text in this document (it may be a scanned PDF).", ai_err_parse: "The model did not return valid questions. Try again or lower the count.", ai_err_generic: "Something went wrong: {msg}", 
 ai_provider: "Provider", ai_custom_model: "or type another model ID (optional)", ai_get_key: "Get a key at {url}", ai_err_model: "Model name not found or not available to your account. Try another model.", 
 };
 

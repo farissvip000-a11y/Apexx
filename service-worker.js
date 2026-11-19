@@ -1,5 +1,5 @@
 /* APEX 27 service worker: offline cache-first for the app shell. */
-const CACHE = 'apex-27-v10';
+const CACHE = 'apex-27-v14';
 const FILES = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 self.addEventListener('install', (e) => { e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting())); });
 self.addEventListener('activate', (e) => { e.waitUntil(caches.keys().then((ks) => Promise.all(ks.filter((k) => k.startsWith('apex27-') && k !== CACHE).map((k) => caches.delete(k)))).then(() => self.clients.claim())); });
