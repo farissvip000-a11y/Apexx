@@ -1,0 +1,27 @@
+{
+  "id": "./",
+  "name": "APEX 27",
+  "short_name": "APEX 27",
+  "description": "APEX 27 - Medical study companion",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#010c28",
+  "theme_color": "#172554",
+  "lang": "ar",
+  "dir": "rtl",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
